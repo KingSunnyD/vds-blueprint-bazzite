@@ -1,261 +1,93 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <stddef.h> 
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/poll.h>
 #include <errno.h>
-#include <sched.h>
 
-#define BT_AF_BLUETOOTH   31
-#define BT_SOCK_SEQPACKET 5
-#define BT_BTPROTO_L2CAP  0
+#define UNIX_PATH "/tmp/vds-proxy-socket"
 
-#define IDX_SRV_CTRL   0
-#define IDX_SRV_INTR   1
-#define IDX_CLI_CTRL   2
-#define IDX_VDSD_CTRL  3
-#define IDX_CLI_INTR   4
-#define IDX_VDSD_INTR  5
-#define TOTAL_FDS      6
+void handle_client(int client_fd) {
+    char buffer[1024];
+    ssize_t bytes_read;
 
-int set_nonblocking_fd(int fd) {
-    if (fd < 0) return -1;
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl == -1) return -1;
-    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    while ((bytes_read = read(client_fd, buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[bytes_read] = '\0';
+        printf("Received: %s", buffer);
+
+        // Process the received data and send a response
+        const char *response = "Data received\n";
+        write(client_fd, response, strlen(response));
+    }
+
+    if (bytes_read < 0) {
+        perror("read");
+    }
+
+    close(client_fd);
 }
 
-int open_bt_server_link(uint16_t psm) {
-    int sock = socket(BT_AF_BLUETOOTH, BT_SOCK_SEQPACKET, BT_BTPROTO_L2CAP);
-    if (sock < 0) return -1;
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    if (set_nonblocking_fd(sock) < 0) {
-        close(sock);
-        return -1;
-    }
-    
-    uint8_t addr_bytes[16];
-    memset(addr_bytes, 0, 16);
-    addr_bytes[0] = BT_AF_BLUETOOTH & 0xFF;
-    addr_bytes[1] = (BT_AF_BLUETOOTH >> 8) & 0xFF;
-    addr_bytes[2] = psm & 0xFF;
-    addr_bytes[3] = (psm >> 8) & 0xFF;
+int main() {
+    int server_fd, client_fd;
+    struct sockaddr_un server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
 
-    if (bind(sock, (struct sockaddr *)addr_bytes, 16) < 0) {
-        close(sock);
-        return -1;
-    }
-    if (listen(sock, 5) < 0) {
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
-
-int connect_unix_pipe(const char *name_three_bytes) {
-    int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (sock < 0) return -1;
-    
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(struct sockaddr_un));
-    addr.sun_family = AF_UNIX;
-    
-    memcpy(addr.sun_path + 1, name_three_bytes, 3); 
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + 3;
-    
-    if (connect(sock, (struct sockaddr *)&addr, len) < 0) {
-        close(sock);
-        return -1;
-    }
-    
-    usleep(2000);
-    
-    if (set_nonblocking_fd(sock) < 0) {
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
-
-int main(void) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IOLBF, 0);
-
-    printf("vDS-Proxy: Starte klammerfreie UNIX-IPC Routing-Infrastruktur...\n");
-
-    int srv_ctrl = open_bt_server_link(0x11);
-    int srv_intr = open_bt_server_link(0x13);
-    if (srv_ctrl < 0 || srv_intr < 0) {
-        fprintf(stderr, "vDS-Proxy: Fehler beim Erstellen der Bluetooth-Serverlinks.\n");
-        return 1;
+    // Create a UNIX domain socket
+    if ((server_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        perror("socket");
+        exit(EXIT_FAILURE);
     }
 
-    int client_ctrl = -1, vdsd_ctrl = -1;
-    int client_intr = -1, vdsd_intr = -1;
+    // Remove any existing socket file
+    unlink(UNIX_PATH);
 
-    void *heap_buffer = malloc(1024);
-    if (!heap_buffer) return 1;
+    // Bind the socket to the specified path
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sun_family = AF_UNIX;
+    strncpy(server_addr.sun_path, UNIX_PATH, sizeof(server_addr.sun_path) - 1);
 
-    printf("vDS-Proxy: Initialisierung erfolgreich. Warte auf DualSense-Controller...\n");
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        perror("bind");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
 
-    struct pollfd fds[TOTAL_FDS];
+    // Listen for incoming connections
+    if (listen(server_fd, 5) == -1) {
+        perror("listen");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("vDS Proxy is running. Waiting for clients...\n");
 
     while (1) {
-        memset(fds, 0, sizeof(fds));
-        
-        fds[IDX_SRV_CTRL].fd = (client_ctrl < 0) ? srv_ctrl : -1;
-        fds[IDX_SRV_CTRL].events = POLLIN;
-        
-        fds[IDX_SRV_INTR].fd = (client_intr < 0) ? srv_intr : -1;
-        fds[IDX_SRV_INTR].events = POLLIN;
-
-        fds[IDX_CLI_CTRL].events  = (client_ctrl >= 0 && vdsd_ctrl >= 0) ? POLLIN : 0;
-        fds[IDX_VDSD_CTRL].events = (vdsd_ctrl >= 0) ? POLLIN : 0;
-        fds[IDX_CLI_INTR].events  = (client_intr >= 0 && vdsd_intr >= 0) ? POLLIN : 0;
-        fds[IDX_VDSD_INTR].events = (vdsd_intr >= 0) ? POLLIN : 0;
-
-
-        int ret = poll(fds, TOTAL_FDS, -1);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            break;
+        // Accept a client connection
+        if ((client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len)) == -1) {
+            perror("accept");
+            continue;
         }
 
-        // ==================== SIMULTANES ABFANGEN DER KANÄLE ====================
-        if (fds[IDX_SRV_CTRL].revents & POLLIN) {
-            int tmp = accept(srv_ctrl, NULL, NULL);
-            if (tmp >= 0) {
-                client_ctrl = tmp;
-                set_nonblocking_fd(client_ctrl);
-                printf("vDS-Proxy: Controller Control-Kanal aktiv abgefangen.\n");
-            }
-        }
+        printf("New client connected\n");
 
-        if (fds[IDX_SRV_INTR].revents & POLLIN) {
-            int tmp = accept(srv_intr, NULL, NULL);
-            if (tmp >= 0) {
-                client_intr = tmp;
-                set_nonblocking_fd(client_intr);
-                printf("vDS-Proxy: Controller Interrupt-Kanal aktiv abgefangen.\n");
-            }
+        // Handle the client connection in a separate process
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process
+            close(server_fd);
+            handle_client(client_fd);
+            exit(EXIT_SUCCESS);
+        } else if (pid > 0) {
+            // Parent process
+            close(client_fd);
+        } else {
+            // Error handling for fork
+            perror("fork");
+            close(client_fd);
         }
-
-        // ERST NACHDEM BEIDE DA SIND: BRÜCKENSCHLAG ZUM VDSD (TIMING-FIX)
-        if (client_ctrl >= 0 && client_intr >= 0 && vdsd_ctrl < 0 && vdsd_intr < 0) {
-            printf("vDS-Proxy: Beide Bluetooth-Kanaele gesichert. Verbinde RAM-Pipelines...\n");
-            vdsd_ctrl = connect_unix_pipe("v_c");
-            vdsd_intr = connect_unix_pipe("v_i");
-            if (vdsd_ctrl >= 0 && vdsd_intr >= 0) {
-                printf("vDS-Proxy: Beide Speicher-Pipelines erfolgreich instanziiert. Tunnel aktiv.\n");
-            } else {
-                fprintf(stderr, "vDS-Proxy: FATAL - IPC-Verbindung zum vdsd fehlgeschlagen.\n");
-                if (vdsd_ctrl >= 0) { close(vdsd_ctrl); vdsd_ctrl = -1; }
-                if (vdsd_intr >= 0) { close(vdsd_intr); vdsd_intr = -1; }
-                close(client_ctrl); client_ctrl = -1;
-                close(client_intr); client_intr = -1;
-            }
-        }
-
-        // ==================== ASYNCHRONES HANDSHAKE BLINDING ====================
-        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & (POLLERR | POLLNVAL | POLLHUP))) {
-            if (!(fds[IDX_CLI_CTRL].revents & POLLIN)) goto shutdown_control;
-        }
-        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & (POLLERR | POLLNVAL | POLLHUP))) {
-            if (!(fds[IDX_CLI_INTR].revents & POLLIN)) goto shutdown_interrupt;
-        }
-        
-        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL))) {
-            goto shutdown_control;
-        }
-        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL))) {
-            goto shutdown_interrupt;
-        }
-
-        // ==================== DATEN-ROUTING: CONTROL-KANAL ====================
-        // ==================== DATEN-ROUTING: CONTROL-KANAL ====================
-        if (client_ctrl >= 0 && vdsd_ctrl >= 0) {
-            if (fds[IDX_CLI_CTRL].revents & POLLIN) {
-                ssize_t len = recv(client_ctrl, heap_buffer, 1024, 0);
-                int local_errno = errno; // <-- HIER SICHERN
-                if (len > 0) {
-                    send(vdsd_ctrl, heap_buffer, len, MSG_DONTWAIT);
-                } else if (len == 0) {
-                    if (fds[IDX_CLI_CTRL].revents & POLLHUP) {
-                        goto shutdown_control;
-                    } else {
-                        break; // <-- REGELEINHALTUNG: break statt continue
-                    }
-                } else if (len < 0 && local_errno != EAGAIN && local_errno != EWOULDBLOCK) {
-                    goto shutdown_control;
-                }
-            }
-            if (fds[IDX_VDSD_CTRL].revents & POLLIN) {
-                ssize_t len = recv(vdsd_ctrl, heap_buffer, 1024, 0);
-                int local_errno = errno; // <-- HIER SICHERN
-                if (len > 0) {
-                    send(client_ctrl, heap_buffer, len, MSG_DONTWAIT);
-                } else if (len == 0) {
-                    goto shutdown_control;
-                } else if (len < 0 && local_errno != EAGAIN && local_errno != EWOULDBLOCK) {
-                    goto shutdown_control;
-                }
-            }
-        }
-
-        // ==================== DATEN-ROUTING: INTERRUPT-KANAL ====================
-        if (client_intr >= 0 && vdsd_intr >= 0) {
-            if (fds[IDX_CLI_INTR].revents & POLLIN) {
-                ssize_t len = recv(client_intr, heap_buffer, 1024, 0);
-                int local_errno = errno; // <-- HIER SICHERN
-                if (len > 0) {
-                    send(vdsd_intr, heap_buffer, len, MSG_DONTWAIT);
-                } else if (len == 0) {
-                    if (fds[IDX_CLI_INTR].revents & POLLHUP) {
-                        goto shutdown_interrupt;
-                    } else {
-                        break; // <-- REGELEINHALTUNG: break statt continue
-                    }
-                } else if (len < 0 && local_errno != EAGAIN && local_errno != EWOULDBLOCK) {
-                    goto shutdown_interrupt;
-                }
-            }
-            if (fds[IDX_VDSD_INTR].revents & POLLIN) {
-                ssize_t len = recv(vdsd_intr, heap_buffer, 1024, 0);
-                int local_errno = errno; // <-- HIER SICHERN
-                if (len > 0) {
-                    send(client_intr, heap_buffer, len, MSG_DONTWAIT);
-                } else if (len == 0) {
-                    goto shutdown_interrupt;
-                } else if (len < 0 && local_errno != EAGAIN && local_errno != EWOULDBLOCK) {
-                    goto shutdown_interrupt;
-                }
-            }
-        }
-        continue;
-
-    shutdown_control:
-        printf("vDS-Proxy: Control-Pipeline getrennt (System-Errno: %d - %s).\n", errno, strerror(errno));
-        if (client_ctrl >= 0) close(client_ctrl);
-        if (vdsd_ctrl >= 0) close(vdsd_ctrl);
-        client_ctrl = -1; vdsd_ctrl = -1;
-        continue;
-
-    shutdown_interrupt:
-        printf("vDS-Proxy: Interrupt-Pipeline getrennt (System-Errno: %d - %s).\n", errno, strerror(errno));
-        if (client_intr >= 0) close(client_intr);
-        if (vdsd_intr >= 0) close(vdsd_intr);
-        client_intr = -1; vdsd_intr = -1;
-        continue;
     }
 
-    free(heap_buffer);
-    close(srv_ctrl); close(srv_intr);
+    close(server_fd);
     return 0;
 }

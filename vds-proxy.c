@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,35 +46,4 @@ int open_bt_server_link(uint16_t psm) {
     }
     int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    if (set_nonblocking_fd(sock) < 0) {
-        close(sock);
-        return -1;
-    }
-
-    uint8_t addr_bytes[16];
-    memset(addr_bytes, 0, 16);
-    addr_bytes[0] = BT_AF_BLUETOOTH & 0xFF;
-    addr_bytes[1] = (BT_AF_BLUETOOTH >> 8) & 0xFF;
-    addr_bytes[2] = psm & 0xFF;
-    addr_bytes[3] = (psm >> 8) & 0xFF;
-    if (bind(sock, (struct sockaddr *)addr_bytes, 16) < 0) {
-        fprintf(stderr, "vDS-Proxy: Fehler beim Binden des Bluetooth-Server-Sockets: %s\n", strerror(errno));
-        close(sock);
-        return -1;
-    }
-    if (listen(sock, 5) < 0) {
-        fprintf(stderr, "vDS-Proxy: Fehler beim Starten des Bluetooth-Server-Sockets: %s\n", strerror(errno));
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
-
-int connect_unix_pipe(const char *name_three_bytes) {
-    int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (sock < 0) {
-        fprintf(stderr, "vDS-Proxy: Fehler beim Erstellen des UNIX-Sockets: %s\n", strerror(errno));
-        return -1;
-    }
-
 }

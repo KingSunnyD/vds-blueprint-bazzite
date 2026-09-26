@@ -76,5 +76,4 @@ int connect_unix_pipe(const char *name_three_bytes) {
         return -1;
     }
 
-    struct sockaddr_un addr;
 }

@@ -1,167 +1,266 @@
-#include "vds_bt.hh"
-#include <sys/socket.h>
-#include <sys/un.h>
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <cstring>
-#include <stdexcept>
-#include <vector>
-#include <span>
-#include <cstddef> 
-#include <stdio.h> 
-#include <cerrno>
+#include <stddef.h> 
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/poll.h>
+#include <errno.h>
+#include <sched.h>
 
-namespace vds {
+#define BT_AF_BLUETOOTH   31
+#define BT_SOCK_SEQPACKET 5
+#define BT_BTPROTO_L2CAP  0
 
-static void setup_abstract_un(struct sockaddr_un &un_addr, const char *name) {
-    std::memset(&un_addr, 0, sizeof(struct sockaddr_un));
-    un_addr.sun_family = AF_UNIX;
-    std::memcpy(un_addr.sun_path + 1, name, 3);
+#define IDX_SRV_CTRL   0
+#define IDX_SRV_INTR   1
+#define IDX_CLI_CTRL   2
+#define IDX_VDSD_CTRL  3
+#define IDX_CLI_INTR   4
+#define IDX_VDSD_INTR  5
+#define TOTAL_FDS      6
+
+struct custom_sockaddr_l2 {
+    uint16_t    l2_family;
+    uint16_t    l2_psm;
+    uint8_t     l2_bdaddr;
+    uint16_t    l2_cid;
+    uint8_t     l2_bdaddr_type;
+};
+
+int set_nonblocking_fd(int fd) {
+    if (fd < 0) return -1;
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl == -1) return -1;
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-static UniqueFd create_ipc_listener(const char *name) {
-    fprintf(stderr, "vDS-CORE: UNTERSTUETZUNG FUER ABSTRAKTE UNIX-SOCKETS AKTIV! Erstelle Pipeline: @%s\n", name);
-    fflush(stderr);
+int open_bt_server_link(uint16_t psm) {
+    int sock = socket(BT_AF_BLUETOOTH, BT_SOCK_SEQPACKET, BT_BTPROTO_L2CAP);
+    if (sock < 0) {
+        fprintf(stderr, "vDS-Proxy: Socket-Erstellung fehlgeschlagen fuer PSM 0x%X: %s\n", psm, strerror(errno));
+        return -1;
+    }
+    
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    if (set_nonblocking_fd(sock) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    struct custom_sockaddr_l2 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.l2_family = BT_AF_BLUETOOTH;
+    addr.l2_psm = psm; 
+    addr.l2_bdaddr_type = 0; 
 
-    int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) throw std::runtime_error("IPC Socket Creation Failed");
-    
-    int reuse = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    
-    struct sockaddr_un un_addr;
-    setup_abstract_un(un_addr, name);
-    
-    socklen_t actual_len = offsetof(struct sockaddr_un, sun_path) + 1 + 3;
-    
-    if (::bind(fd, reinterpret_cast<const struct sockaddr*>(&un_addr), actual_len) < 0) {
-        fprintf(stderr, "vDS-CORE: FATAL - Bind fuer @%s failed: %s\n", name, std::strerror(errno));
-        fflush(stderr);
-        ::close(fd);
-        throw std::runtime_error("IPC Bind Failed");
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "vDS-Proxy: Bind fehlgeschlagen fuer PSM 0x%X: %s\n", psm, strerror(errno));
+        close(sock);
+        return -1;
     }
-    
-    if (::listen(fd, 5) < 0) {
-        ::close(fd);
-        throw std::runtime_error("IPC Listen Failed");
+    if (listen(sock, 5) < 0) {
+        fprintf(stderr, "vDS-Proxy: Listen fehlgeschlagen fuer PSM 0x%X: %s\n", psm, strerror(errno));
+        close(sock);
+        return -1;
     }
-    return UniqueFd(fd);
+    return sock;
 }
 
-BtL2capAcceptor::BtL2capAcceptor() 
-    : control_listener_fd_(create_ipc_listener("v_c")), 
-      interrupt_listener_fd_(create_ipc_listener("v_i")) {}
-
-std::optional<BtAcceptedChannel> BtL2capAcceptor::accept_control() {
-    struct sockaddr_un peer;
-    socklen_t len = sizeof(struct sockaddr_un);
-    std::memset(&peer, 0, sizeof(struct sockaddr_un));
-
-    int fd = ::accept(control_listener_fd_.get(), reinterpret_cast<struct sockaddr*>(&peer), &len);
+int connect_unix_pipe(const char *name_three_bytes) {
+    int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (sock < 0) return -1;
     
-    if (fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return std::nullopt;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+    
+    memcpy(addr.sun_path + 1, name_three_bytes, 3); 
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + 3;
+    
+    if (connect(sock, (struct sockaddr *)&addr, len) < 0) {
+        close(sock);
+        return -1;
+    }
+    
+    usleep(2000); 
+    
+    if (set_nonblocking_fd(sock) < 0) {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+
+    printf("vDS-Proxy: Starte klammerfreie UNIX-IPC Routing-Infrastruktur...\n");
+
+    int srv_ctrl = open_bt_server_link(0x11);
+    int srv_intr = open_bt_server_link(0x13);
+    if (srv_ctrl < 0 || srv_intr < 0) {
+        fprintf(stderr, "vDS-Proxy: Fehler beim Erstellen der Bluetooth-Serverlinks.\n");
+        return 1;
+    }
+
+    int client_ctrl = -1, vdsd_ctrl = -1;
+    int client_intr = -1, vdsd_intr = -1;
+
+    void *heap_buffer = malloc(1024);
+    if (!heap_buffer) return 1;
+
+    printf("vDS-Proxy: Initialisierung erfolgreich. Warte auf DualSense-Controller...\n");
+
+    struct pollfd fds[TOTAL_FDS];
+
+    while (1) {
+        memset(fds, 0, sizeof(fds));
+        
+        fds[IDX_SRV_CTRL].fd = (client_ctrl < 0) ? srv_ctrl : -1;
+        fds[IDX_SRV_CTRL].events = POLLIN;
+        
+        fds[IDX_SRV_INTR].fd = (client_intr < 0) ? srv_intr : -1;
+        fds[IDX_SRV_INTR].events = POLLIN;
+
+        fds[IDX_CLI_CTRL].fd  = client_ctrl;  fds[IDX_CLI_CTRL].events  = (client_ctrl >= 0) ? POLLIN : 0;
+        fds[IDX_VDSD_CTRL].fd = vdsd_ctrl;    fds[IDX_VDSD_CTRL].events = (vdsd_ctrl >= 0) ? POLLIN : 0;
+        fds[IDX_CLI_INTR].fd  = client_intr;  fds[IDX_CLI_INTR].events  = (client_intr >= 0) ? POLLIN : 0;
+        fds[IDX_VDSD_INTR].fd = vdsd_intr;    fds[IDX_VDSD_INTR].events = (vdsd_intr >= 0) ? POLLIN : 0;
+
+        int ret = poll(fds, TOTAL_FDS, -1);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
-        fprintf(stderr, "vDS-CORE: Kritischer accept-Fehler auf Control: %s\n", std::strerror(errno));
-        fflush(stderr);
-        return std::nullopt;
-    }
-    
-    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
-    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    
-    fprintf(stderr, "vDS-CORE: Control-Kanal erfolgreich per accept() aus Epoll-Event extrahiert.\n");
-    fflush(stderr);
-    
-    return BtAcceptedChannel{.address = "00:1b:dc:00:00:00", .fd = UniqueFd(fd)};
-}
 
-std::optional<BtAcceptedChannel> BtL2capAcceptor::accept_interrupt() {
-    struct sockaddr_un peer;
-    socklen_t len = sizeof(struct sockaddr_un);
-    std::memset(&peer, 0, sizeof(struct sockaddr_un));
-
-    int fd = ::accept(interrupt_listener_fd_.get(), reinterpret_cast<struct sockaddr*>(&peer), &len);
-    
-    if (fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return std::nullopt;
+        if (fds[IDX_SRV_CTRL].revents & POLLIN) {
+            int tmp = accept(srv_ctrl, NULL, NULL);
+            if (tmp >= 0) {
+                client_ctrl = tmp;
+                set_nonblocking_fd(client_ctrl);
+                printf("vDS-Proxy: Controller Control-Kanal aktiv abgefangen.\n");
+            }
         }
-        fprintf(stderr, "vDS-CORE: Kritischer accept-Fehler auf Interrupt: %s\n", std::strerror(errno));
-        fflush(stderr);
-        return std::nullopt;
+
+        if (fds[IDX_SRV_INTR].revents & POLLIN) {
+            int tmp = accept(srv_intr, NULL, NULL);
+            if (tmp >= 0) {
+                client_intr = tmp;
+                set_nonblocking_fd(client_intr);
+                printf("vDS-Proxy: Controller Interrupt-Kanal aktiv abgefangen.\n");
+            }
+        }
+
+        if (client_ctrl >= 0 && client_intr >= 0 && vdsd_ctrl < 0 && vdsd_intr < 0) {
+            printf("vDS-Proxy: Beide Bluetooth-Kanaele gesichert. Verbinde RAM-Pipelines...\n");
+            vdsd_ctrl = connect_unix_pipe("v_c");
+            vdsd_intr = connect_unix_pipe("v_i");
+            if (vdsd_ctrl >= 0 && vdsd_intr >= 0) {
+                printf("vDS-Proxy: Beide Speicher-Pipelines erfolgreich instanziiert. Tunnel aktiv.\n");
+            } else {
+                fprintf(stderr, "vDS-Proxy: FATAL - IPC-Verbindung zum vdsd fehlgeschlagen.\n");
+                if (vdsd_ctrl >= 0) { close(vdsd_ctrl); vdsd_ctrl = -1; }
+                if (vdsd_intr >= 0) { close(vdsd_intr); vdsd_intr = -1; }
+                close(client_ctrl); client_ctrl = -1;
+                close(client_intr); client_intr = -1;
+            }
+        }
+
+        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+            if (!(fds[IDX_CLI_CTRL].revents & POLLIN)) goto shutdown_control;
+        }
+        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+            if (!(fds[IDX_CLI_INTR].revents & POLLIN)) goto shutdown_interrupt;
+        }
+        
+        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+            goto shutdown_control;
+        }
+        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+            goto shutdown_interrupt;
+        }
+
+        if (client_ctrl >= 0 && vdsd_ctrl >= 0) {
+            if (fds[IDX_CLI_CTRL].revents & POLLIN) {
+                ssize_t len = recv(client_ctrl, heap_buffer, 1024, 0);
+                if (len > 0) {
+                    send(vdsd_ctrl, heap_buffer, len, MSG_DONTWAIT);
+                } else if (len == 0) {
+                    if (fds[IDX_CLI_CTRL].revents & POLLHUP) {
+                        goto shutdown_control;
+                    } else {
+                        sched_yield(); usleep(2000);
+                        continue; 
+                    }
+                } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    goto shutdown_control;
+                }
+            }
+            if (fds[IDX_VDSD_CTRL].revents & POLLIN) {
+                ssize_t len = recv(vdsd_ctrl, heap_buffer, 1024, 0);
+                if (len > 0) {
+                    send(client_ctrl, heap_buffer, len, MSG_DONTWAIT);
+                } else if (len == 0) {
+                    goto shutdown_control;
+                } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    goto shutdown_control;
+                }
+            }
+        }
+
+        if (client_intr >= 0 && vdsd_intr >= 0) {
+            if (fds[IDX_CLI_INTR].revents & POLLIN) {
+                ssize_t len = recv(client_intr, heap_buffer, 1024, 0);
+                if (len > 0) {
+                    send(vdsd_intr, heap_buffer, len, MSG_DONTWAIT);
+                } else if (len == 0) {
+                    if (fds[IDX_CLI_INTR].revents & POLLHUP) {
+                        goto shutdown_interrupt;
+                    } else {
+                        sched_yield(); usleep(2000);
+                        continue; 
+                    }
+                } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    goto shutdown_interrupt;
+                }
+            }
+            if (fds[IDX_VDSD_INTR].revents & POLLIN) {
+                ssize_t len = recv(vdsd_intr, heap_buffer, 1024, 0);
+                if (len > 0) {
+                    send(client_intr, heap_buffer, len, MSG_DONTWAIT);
+                } else if (len == 0) {
+                    goto shutdown_interrupt;
+                } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    goto shutdown_interrupt;
+                }
+            }
+        }
+        continue;
+
+    shutdown_control:
+        printf("vDS-Proxy: Control-Pipeline getrennt (System-Errno: %d - %s).\n", errno, strerror(errno));
+        if (client_ctrl >= 0) close(client_ctrl);
+        if (vdsd_ctrl >= 0) close(vdsd_ctrl);
+        client_ctrl = -1; vdsd_ctrl = -1;
+        continue;
+
+    shutdown_interrupt:
+        printf("vDS-Proxy: Interrupt-Pipeline getrennt (System-Errno: %d - %s).\n", errno, strerror(errno));
+        if (client_intr >= 0) close(client_intr);
+        if (vdsd_intr >= 0) close(vdsd_intr);
+        client_intr = -1; vdsd_intr = -1;
+        continue;
     }
-    
-    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
-    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    
-    fprintf(stderr, "vDS-CORE: Interrupt-Kanal erfolgreich per accept() aus Epoll-Event extrahiert.\n");
-    fflush(stderr);
-    
-    return BtAcceptedChannel{.address = "00:1b:dc:00:00:00", .fd = UniqueFd(fd)};
+
+    free(heap_buffer);
+    close(srv_ctrl); close(srv_intr);
+    return 0;
 }
-
-BtL2capBackend::BtL2capBackend(std::string addr, UniqueFd c, UniqueFd i) 
-    : address_(addr), control_fd_(c.release()), interrupt_fd_(i.release()) {}
-
-BtL2capBackend::~BtL2capBackend() { 
-    if(control_fd_ >= 0) ::close(control_fd_); 
-    if(interrupt_fd_ >= 0) ::close(interrupt_fd_); 
-}
-
-BtL2capBackend::BtL2capBackend(BtL2capBackend &&other) noexcept 
-    : address_(std::move(other.address_)), control_fd_(other.control_fd_), interrupt_fd_(other.interrupt_fd_) {
-    other.control_fd_ = -1;
-    other.interrupt_fd_ = -1;
-}
-
-BtL2capBackend &BtL2capBackend::operator=(BtL2capBackend &&other) noexcept {
-    if (this != &other) {
-        if(control_fd_ >= 0) ::close(control_fd_);
-        if(interrupt_fd_ >= 0) ::close(interrupt_fd_);
-        address_ = std::move(other.address_);
-        control_fd_ = other.control_fd_;
-        interrupt_fd_ = other.interrupt_fd_;
-        other.control_fd_ = -1;
-        other.interrupt_fd_ = -1;
-    }
-    return *this;
-}
-
-void BtL2capBackend::send_output_report(std::span<const std::uint8_t> r) { 
-    if (interrupt_fd_ >= 0) ::write(interrupt_fd_, r.data(), r.size()); 
-}
-
-bool BtL2capBackend::try_send_output_report(std::span<const std::uint8_t> r) { 
-    if (interrupt_fd_ < 0) return false;
-    return ::write(interrupt_fd_, r.data(), r.size()) > 0; 
-}
-
-void BtL2capBackend::send_feature_get(std::uint8_t id) {
-    fprintf(stderr, "vDS-SPOOF: Modalias usb:v054Cp0CE6d0100 aktiv an L2CAP gemeldet.\n");
-    fflush(stderr);
-}
-
-void BtL2capBackend::send_feature_set(std::span<const std::uint8_t> r) {
-    fflush(stderr);
-}
-
-std::optional<std::vector<std::uint8_t>> BtL2capBackend::read_feature_report() { 
-    std::vector<std::uint8_t> fake_report = {
-        0x05, 
-        0x00, 0x1b, 0xdc, 0x00, 0x00, 0x00, 
-        0x4C, 0x05, 0xE6, 0x0C 
-    };
-    return fake_report;
-}
-
-std::optional<std::vector<std::uint8_t>> BtL2capBackend::read_interrupt_packet() {
-    std::vector<std::uint8_t> buf(110);
-    int n = ::read(interrupt_fd_, buf.data(), buf.size());
-    if(n <= 0) return std::nullopt;
-    buf.resize(n);
-    return buf;
-}
-
-} // namespace vds

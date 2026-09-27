@@ -24,6 +24,15 @@
 #define IDX_VDSD_INTR  5
 #define TOTAL_FDS      6
 
+// Struktur-Replikation der originalen Linux L2CAP Adresse zur Vermeidung von Garbage-Daten im Kernel
+struct custom_sockaddr_l2 {
+    uint16_t    l2_family;
+    uint16_t    l2_psm;
+    uint8_t     l2_bdaddr;
+    uint16_t    l2_cid;
+    uint8_t     l2_bdaddr_type;
+};
+
 int set_nonblocking_fd(int fd) {
     if (fd < 0) return -1;
     int fl = fcntl(fd, F_GETFL, 0);
@@ -41,14 +50,14 @@ int open_bt_server_link(uint16_t psm) {
         return -1;
     }
     
-    uint8_t addr_bytes[16];
-    memset(addr_bytes, 0, 16);
-    addr_bytes[0] = BT_AF_BLUETOOTH & 0xFF;
-    addr_bytes[1] = (BT_AF_BLUETOOTH >> 8) & 0xFF;
-    addr_bytes[2] = psm & 0xFF;
-    addr_bytes[3] = (psm >> 8) & 0xFF;
+    // Typsichere Initialisierung statt rohem Byte-Array zur Verhinderung von Kernel-Verwürfen
+    struct custom_sockaddr_l2 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.l2_family = BT_AF_BLUETOOTH;
+    addr.l2_psm = psm; 
+    addr.l2_bdaddr_type = 0; // Standard BREDR-Typ
 
-    if (bind(sock, (struct sockaddr *)addr_bytes, 16) < 0) {
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(sock);
         return -1;
     }
@@ -170,10 +179,10 @@ int main(void) {
             if (!(fds[IDX_CLI_INTR].revents & POLLIN)) goto shutdown_interrupt;
         }
         
-        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL))) {
+        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL | POLLHUP))) {
             goto shutdown_control;
         }
-        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL))) {
+        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL | POLLHUP))) {
             goto shutdown_interrupt;
         }
 
@@ -188,7 +197,7 @@ int main(void) {
                         goto shutdown_control;
                     } else {
                         sched_yield(); usleep(2000);
-                        break; // FIX: Verhindert Einfrieren des anderen Kanals
+                        continue; // FIX: Ersetzt das gefährliche break; um den Loop am Leben zu halten
                     }
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_control;
@@ -217,7 +226,7 @@ int main(void) {
                         goto shutdown_interrupt;
                     } else {
                         sched_yield(); usleep(2000);
-                        break; // FIX: Verhindert Einfrieren des anderen Kanals
+                        continue; // FIX: Ersetzt das gefährliche break; um den Loop am Leben zu halten
                     }
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_interrupt;

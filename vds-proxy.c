@@ -50,7 +50,6 @@ int open_bt_server_link(uint16_t psm) {
         return -1;
     }
     
-    // Typsichere Initialisierung statt rohem Byte-Array zur Verhinderung von Kernel-Verwürfen
     struct custom_sockaddr_l2 addr;
     memset(&addr, 0, sizeof(addr));
     addr.l2_family = BT_AF_BLUETOOTH;
@@ -141,6 +140,7 @@ int main(void) {
             int tmp = accept(srv_ctrl, NULL, NULL);
             if (tmp >= 0) {
                 client_ctrl = tmp;
+                fcntl(client_ctrl, F_SETFD, FD_CLOEXEC);
                 set_nonblocking_fd(client_ctrl);
                 printf("vDS-Proxy: Controller Control-Kanal aktiv abgefangen.\n");
             }
@@ -150,12 +150,13 @@ int main(void) {
             int tmp = accept(srv_intr, NULL, NULL);
             if (tmp >= 0) {
                 client_intr = tmp;
+                fcntl(client_intr, F_SETFD, FD_CLOEXEC);
                 set_nonblocking_fd(client_intr);
                 printf("vDS-Proxy: Controller Interrupt-Kanal aktiv abgefangen.\n");
             }
         }
 
-        // ERST NACHDEM BEIDE DA SIND: BRÜCKENSCHLAG ZUM VDSD (TIMING-FIX)
+        // ERST NACHDEM BEIDE DA SIND: BRÜCKENSCHLAG ZUM VDSD (SIMULTAN-SCHUTZ)
         if (client_ctrl >= 0 && client_intr >= 0 && vdsd_ctrl < 0 && vdsd_intr < 0) {
             printf("vDS-Proxy: Beide Bluetooth-Kanaele gesichert. Verbinde RAM-Pipelines...\n");
             vdsd_ctrl = connect_unix_pipe("v_c");
@@ -193,16 +194,17 @@ int main(void) {
                 if (len > 0) {
                     send(vdsd_ctrl, heap_buffer, len, MSG_DONTWAIT);
                 } else if (len == 0) {
-                    if (fds[IDX_CLI_CTRL].revents & POLLHUP) {
+                    if ((fds[IDX_CLI_CTRL].revents & POLLHUP) && !(fds[IDX_CLI_CTRL].revents & POLLIN)) {
                         goto shutdown_control;
                     } else {
-                        sched_yield(); usleep(2000);
-                        continue; // FIX: Ersetzt das gefährliche break; um den Loop am Leben zu halten
+                        goto skip_cli_ctrl; 
                     }
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_control;
                 }
             }
+        skip_cli_ctrl:
+
             if (fds[IDX_VDSD_CTRL].revents & POLLIN) {
                 ssize_t len = recv(vdsd_ctrl, heap_buffer, 1024, 0);
                 if (len > 0) {
@@ -222,16 +224,17 @@ int main(void) {
                 if (len > 0) {
                     send(vdsd_intr, heap_buffer, len, MSG_DONTWAIT);
                 } else if (len == 0) {
-                    if (fds[IDX_CLI_INTR].revents & POLLHUP) {
+                    if ((fds[IDX_CLI_INTR].revents & POLLHUP) && !(fds[IDX_CLI_INTR].revents & POLLIN)) {
                         goto shutdown_interrupt;
                     } else {
-                        sched_yield(); usleep(2000);
-                        continue; // FIX: Ersetzt das gefährliche break; um den Loop am Leben zu halten
+                        goto skip_cli_intr;
                     }
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_interrupt;
                 }
             }
+        skip_cli_intr:
+
             if (fds[IDX_VDSD_INTR].revents & POLLIN) {
                 ssize_t len = recv(vdsd_intr, heap_buffer, 1024, 0);
                 if (len > 0) {

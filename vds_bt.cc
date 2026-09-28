@@ -120,7 +120,7 @@ BtL2capBackend &BtL2capBackend::operator=(BtL2capBackend &&other) noexcept {
     if (this != &other) {
         if(control_fd_ >= 0) ::close(control_fd_);
         if(interrupt_fd_ >= 0) ::close(interrupt_fd_);
-        address = std::move(other.address_);
+        address_ = std::move(other.address_); // FIX: Unterstrich hinzugefügt
         control_fd_ = other.control_fd_;
         interrupt_fd_ = other.interrupt_fd_;
         other.control_fd_ = -1;
@@ -148,13 +148,11 @@ void BtL2capBackend::send_feature_set(std::span<const std::uint8_t> r) {
 }
 
 std::optional<std::vector<std::uint8_t>> BtL2capBackend::read_feature_report() { 
-    // Der Linux hid-playstation Treiber erwartet für Report 0x05 exakt 9 Bytes Nutzinformationen
-    // Struktur: [0] Report ID + [1-6] MAC rückwärts + [7-8] Sony-spezifische Handshake/Firmware-Bits
     std::vector<std::uint8_t> fake_report(9, 0x00);
     
     fake_report[0] = 0x05; // Report ID
     
-    // MAC-Adresse "00:1b:dc:00:00:00" zwingend in REVERSE-Reihenfolge (Little Endian für Kernel)
+    // MAC-Adresse "00:1b:dc:00:00:00" in REVERSE-Reihenfolge (Little Endian)
     fake_report[1] = 0x00; 
     fake_report[2] = 0x00;
     fake_report[3] = 0x00;
@@ -162,7 +160,7 @@ std::optional<std::vector<std::uint8_t>> BtL2capBackend::read_feature_report() {
     fake_report[5] = 0x1b;
     fake_report[6] = 0x00;
     
-    // Sony Vendor Match-Prüfbits für den hid-playstation Treiber-Handshake
+    // Sony Vendor Match-Prüfbits für hid-playstation Handshake
     fake_report[7] = 0x4C; 
     fake_report[8] = 0x05;
     

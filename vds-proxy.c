@@ -24,7 +24,6 @@
 #define IDX_VDSD_INTR  5
 #define TOTAL_FDS      6
 
-// Struktur-Replikation der originalen Linux L2CAP Adresse zur Vermeidung von Garbage-Daten im Kernel
 struct custom_sockaddr_l2 {
     uint16_t    l2_family;
     uint16_t    l2_psm;
@@ -54,7 +53,7 @@ int open_bt_server_link(uint16_t psm) {
     memset(&addr, 0, sizeof(addr));
     addr.l2_family = BT_AF_BLUETOOTH;
     addr.l2_psm = psm; 
-    addr.l2_bdaddr_type = 0; // Standard BREDR-Typ
+    addr.l2_bdaddr_type = 0;
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(sock);
@@ -135,8 +134,7 @@ int main(void) {
             break;
         }
 
-        // ==================== SIMULTANES ABFANGEN DER KANÄLE ====================
-        if (fds[IDX_SRV_CTRL].revents & POLLIN) {
+        if (fds[IDX_SRV_CTRL].fd >= 0 && (fds[IDX_SRV_CTRL].revents & POLLIN)) {
             int tmp = accept(srv_ctrl, NULL, NULL);
             if (tmp >= 0) {
                 client_ctrl = tmp;
@@ -146,7 +144,7 @@ int main(void) {
             }
         }
 
-        if (fds[IDX_SRV_INTR].revents & POLLIN) {
+        if (fds[IDX_SRV_INTR].fd >= 0 && (fds[IDX_SRV_INTR].revents & POLLIN)) {
             int tmp = accept(srv_intr, NULL, NULL);
             if (tmp >= 0) {
                 client_intr = tmp;
@@ -156,38 +154,51 @@ int main(void) {
             }
         }
 
-        // ERST NACHDEM BEIDE DA SIND: BRÜCKENSCHLAG ZUM VDSD (SIMULTAN-SCHUTZ)
         if (client_ctrl >= 0 && client_intr >= 0 && vdsd_ctrl < 0 && vdsd_intr < 0) {
             printf("vDS-Proxy: Beide Bluetooth-Kanaele gesichert. Verbinde RAM-Pipelines...\n");
             vdsd_ctrl = connect_unix_pipe("v_c");
             vdsd_intr = connect_unix_pipe("v_i");
             if (vdsd_ctrl >= 0 && vdsd_intr >= 0) {
                 printf("vDS-Proxy: Beide Speicher-Pipelines erfolgreich instanziiert. Tunnel aktiv.\n");
+                continue;
             } else {
                 fprintf(stderr, "vDS-Proxy: FATAL - IPC-Verbindung zum vdsd fehlgeschlagen.\n");
                 if (vdsd_ctrl >= 0) { close(vdsd_ctrl); vdsd_ctrl = -1; }
                 if (vdsd_intr >= 0) { close(vdsd_intr); vdsd_intr = -1; }
                 close(client_ctrl); client_ctrl = -1;
                 close(client_intr); client_intr = -1;
+                continue;
             }
         }
 
-        // ==================== ASYNCHRONES HANDSHAKE BLINDING ====================
-        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & (POLLERR | POLLNVAL | POLLHUP))) {
-            if (!(fds[IDX_CLI_CTRL].revents & POLLIN)) goto shutdown_control;
-        }
-        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & (POLLERR | POLLNVAL | POLLHUP))) {
-            if (!(fds[IDX_CLI_INTR].revents & POLLIN)) goto shutdown_interrupt;
-        }
-        
-        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & (POLLERR | POLLNVAL))) {
             goto shutdown_control;
         }
-        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL | POLLHUP))) {
+        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & POLLHUP) && !(fds[IDX_CLI_CTRL].revents & POLLIN)) {
+            goto shutdown_control;
+        }
+
+        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & (POLLERR | POLLNVAL))) {
+            goto shutdown_interrupt;
+        }
+        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & POLLHUP) && !(fds[IDX_CLI_INTR].revents & POLLIN)) {
+            goto shutdown_interrupt;
+        }
+        
+        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL))) {
+            goto shutdown_control;
+        }
+        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & POLLHUP) && !(fds[IDX_VDSD_CTRL].revents & POLLIN)) {
+            goto shutdown_control;
+        }
+
+        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL))) {
+            goto shutdown_interrupt;
+        }
+        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & POLLHUP) && !(fds[IDX_VDSD_INTR].revents & POLLIN)) {
             goto shutdown_interrupt;
         }
 
-        // ==================== DATEN-ROUTING: CONTROL-KANAL ====================
         if (client_ctrl >= 0 && vdsd_ctrl >= 0) {
             if (fds[IDX_CLI_CTRL].revents & POLLIN) {
                 ssize_t len = recv(client_ctrl, heap_buffer, 1024, 0);
@@ -217,7 +228,6 @@ int main(void) {
             }
         }
 
-        // ==================== DATEN-ROUTING: INTERRUPT-KANAL ====================
         if (client_intr >= 0 && vdsd_intr >= 0) {
             if (fds[IDX_CLI_INTR].revents & POLLIN) {
                 ssize_t len = recv(client_intr, heap_buffer, 1024, 0);

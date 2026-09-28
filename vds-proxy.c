@@ -11,6 +11,7 @@
 #include <sys/poll.h>
 #include <errno.h>
 #include <sched.h>
+#include <signal.h> // Hinzugefügt für SIG_IGN
 
 #define BT_AF_BLUETOOTH   31
 #define BT_SOCK_SEQPACKET 5
@@ -74,8 +75,12 @@ int connect_unix_pipe(const char *name_three_bytes) {
     memset(&addr, 0, sizeof(struct sockaddr_un));
     addr.sun_family = AF_UNIX;
     
+    // Strikte 6-Byte-Regel einhalten: Erstes Byte ist \0, dann 3 Bytes Name
+    addr.sun_path[0] = '\0';
     memcpy(addr.sun_path + 1, name_three_bytes, 3); 
-    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + 3;
+    
+    // KORREKTUR: offsetof + 1 (für \0) + 3 (Nutzdaten) = exakt 4 zusätzliche Bytes
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 4;
     
     if (connect(sock, (struct sockaddr *)&addr, len) < 0) {
         close(sock);
@@ -92,6 +97,9 @@ int connect_unix_pipe(const char *name_three_bytes) {
 }
 
 int main(void) {
+    // Signal-Absturzsicherung: SIGPIPE global ignorieren
+    signal(SIGPIPE, SIG_IGN);
+
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
@@ -154,6 +162,7 @@ int main(void) {
             }
         }
 
+        // Simultaner Doppel-Connect Schutz
         if (client_ctrl >= 0 && client_intr >= 0 && vdsd_ctrl < 0 && vdsd_intr < 0) {
             printf("vDS-Proxy: Beide Bluetooth-Kanaele gesichert. Verbinde RAM-Pipelines...\n");
             vdsd_ctrl = connect_unix_pipe("v_c");
@@ -171,56 +180,40 @@ int main(void) {
             }
         }
 
-        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & (POLLERR | POLLNVAL))) {
-            goto shutdown_control;
-        }
-        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & POLLHUP) && !(fds[IDX_CLI_CTRL].revents & POLLIN)) {
-            goto shutdown_control;
-        }
+        // Striktes POLLHUP/Fehler-Handling
+        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & (POLLERR | POLLNVAL))) goto shutdown_control;
+        if (client_ctrl >= 0 && (fds[IDX_CLI_CTRL].revents & POLLHUP) && !(fds[IDX_CLI_CTRL].revents & POLLIN)) goto shutdown_control;
 
-        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & (POLLERR | POLLNVAL))) {
-            goto shutdown_interrupt;
-        }
-        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & POLLHUP) && !(fds[IDX_CLI_INTR].revents & POLLIN)) {
-            goto shutdown_interrupt;
-        }
+        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & (POLLERR | POLLNVAL))) goto shutdown_interrupt;
+        if (client_intr >= 0 && (fds[IDX_CLI_INTR].revents & POLLHUP) && !(fds[IDX_CLI_INTR].revents & POLLIN)) goto shutdown_interrupt;
         
-        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL))) {
-            goto shutdown_control;
-        }
-        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & POLLHUP) && !(fds[IDX_VDSD_CTRL].revents & POLLIN)) {
-            goto shutdown_control;
-        }
+        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & (POLLERR | POLLNVAL))) goto shutdown_control;
+        if (vdsd_ctrl >= 0 && (fds[IDX_VDSD_CTRL].revents & POLLHUP) && !(fds[IDX_VDSD_CTRL].revents & POLLIN)) goto shutdown_control;
 
-        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL))) {
-            goto shutdown_interrupt;
-        }
-        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & POLLHUP) && !(fds[IDX_VDSD_INTR].revents & POLLIN)) {
-            goto shutdown_interrupt;
-        }
+        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & (POLLERR | POLLNVAL))) goto shutdown_interrupt;
+        if (vdsd_intr >= 0 && (fds[IDX_VDSD_INTR].revents & POLLHUP) && !(fds[IDX_VDSD_INTR].revents & POLLIN)) goto shutdown_interrupt;
 
+        // --- CONTROL KANAL DATA ROUTING ---
         if (client_ctrl >= 0 && vdsd_ctrl >= 0) {
             if (fds[IDX_CLI_CTRL].revents & POLLIN) {
                 ssize_t len = recv(client_ctrl, heap_buffer, 1024, 0);
                 if (len > 0) {
-                    send(vdsd_ctrl, heap_buffer, len, MSG_DONTWAIT);
+                    // KORREKTUR: MSG_NOSIGNAL schützt vor Abstürzen
+                    send(vdsd_ctrl, heap_buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
                 } else if (len == 0) {
-                    if ((fds[IDX_CLI_CTRL].revents & POLLHUP) && !(fds[IDX_CLI_CTRL].revents & POLLIN)) {
-                        goto shutdown_control;
-                    } else {
-                        goto skip_cli_ctrl; 
-                    }
+                    // Zero-Length Loop-Block Schutz
+                    break; 
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_control;
                 }
             }
-        skip_cli_ctrl:
 
             if (fds[IDX_VDSD_CTRL].revents & POLLIN) {
                 ssize_t len = recv(vdsd_ctrl, heap_buffer, 1024, 0);
                 if (len > 0) {
-                    send(client_ctrl, heap_buffer, len, MSG_DONTWAIT);
+                    send(client_ctrl, heap_buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
                 } else if (len == 0) {
+                    // Zero-Length RAM-Kanal = Tunnel-Ende
                     goto shutdown_control;
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_control;
@@ -228,28 +221,26 @@ int main(void) {
             }
         }
 
+        // --- INTERRUPT KANAL DATA ROUTING ---
         if (client_intr >= 0 && vdsd_intr >= 0) {
             if (fds[IDX_CLI_INTR].revents & POLLIN) {
                 ssize_t len = recv(client_intr, heap_buffer, 1024, 0);
                 if (len > 0) {
-                    send(vdsd_intr, heap_buffer, len, MSG_DONTWAIT);
+                    send(vdsd_intr, heap_buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
                 } else if (len == 0) {
-                    if ((fds[IDX_CLI_INTR].revents & POLLHUP) && !(fds[IDX_CLI_INTR].revents & POLLIN)) {
-                        goto shutdown_interrupt;
-                    } else {
-                        goto skip_cli_intr;
-                    }
+                    // Zero-Length Loop-Block Schutz
+                    break;
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_interrupt;
                 }
             }
-        skip_cli_intr:
 
             if (fds[IDX_VDSD_INTR].revents & POLLIN) {
                 ssize_t len = recv(vdsd_intr, heap_buffer, 1024, 0);
                 if (len > 0) {
-                    send(client_intr, heap_buffer, len, MSG_DONTWAIT);
+                    send(client_intr, heap_buffer, len, MSG_DONTWAIT | MSG_NOSIGNAL);
                 } else if (len == 0) {
+                    // Zero-Length RAM-Kanal = Tunnel-Ende
                     goto shutdown_interrupt;
                 } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     goto shutdown_interrupt;

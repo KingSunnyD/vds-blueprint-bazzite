@@ -57,7 +57,8 @@ std::optional<BtAcceptedChannel> BtL2capAcceptor::accept_control() {
     socklen_t len = sizeof(struct sockaddr_un);
     std::memset(&peer, 0, sizeof(struct sockaddr_un));
 
-    int fd = ::accept(control_listener_fd_.get(), reinterpret_cast<struct sockaddr*>(&peer), &len);
+    // Atomares accept4 mit SOCK_NONBLOCK & SOCK_CLOEXEC zur Vermeidung von Race-Conditions
+    int fd = ::accept4(control_listener_fd_.get(), reinterpret_cast<struct sockaddr*>(&peer), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     
     if (fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -67,9 +68,6 @@ std::optional<BtAcceptedChannel> BtL2capAcceptor::accept_control() {
         fflush(stderr);
         return std::nullopt;
     }
-    
-    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
-    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     
     fprintf(stderr, "vDS-CORE: Control-Kanal erfolgreich per accept() aus Epoll-Event extrahiert.\n");
     fflush(stderr);
@@ -82,7 +80,8 @@ std::optional<BtAcceptedChannel> BtL2capAcceptor::accept_interrupt() {
     socklen_t len = sizeof(struct sockaddr_un);
     std::memset(&peer, 0, sizeof(struct sockaddr_un));
 
-    int fd = ::accept(interrupt_listener_fd_.get(), reinterpret_cast<struct sockaddr*>(&peer), &len);
+    // Atomares accept4 mit SOCK_NONBLOCK & SOCK_CLOEXEC zur Vermeidung von Race-Conditions
+    int fd = ::accept4(interrupt_listener_fd_.get(), reinterpret_cast<struct sockaddr*>(&peer), &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
     
     if (fd < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -92,9 +91,6 @@ std::optional<BtAcceptedChannel> BtL2capAcceptor::accept_interrupt() {
         fflush(stderr);
         return std::nullopt;
     }
-    
-    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
-    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     
     fprintf(stderr, "vDS-CORE: Interrupt-Kanal erfolgreich per accept() aus Epoll-Event extrahiert.\n");
     fflush(stderr);
@@ -120,7 +116,7 @@ BtL2capBackend &BtL2capBackend::operator=(BtL2capBackend &&other) noexcept {
     if (this != &other) {
         if(control_fd_ >= 0) ::close(control_fd_);
         if(interrupt_fd_ >= 0) ::close(interrupt_fd_);
-        address_ = std::move(other.address_); // FIX: Unterstrich hinzugefügt
+        address_ = std::move(other.address_);
         control_fd_ = other.control_fd_;
         interrupt_fd_ = other.interrupt_fd_;
         other.control_fd_ = -1;
@@ -130,12 +126,13 @@ BtL2capBackend &BtL2capBackend::operator=(BtL2capBackend &&other) noexcept {
 }
 
 void BtL2capBackend::send_output_report(std::span<const std::uint8_t> r) { 
-    if (interrupt_fd_ >= 0) ::write(interrupt_fd_, r.data(), r.size()); 
+    // Nutzen von send mit MSG_NOSIGNAL schützt den vdsd vor SIGPIPE-Abstürzen
+    if (interrupt_fd_ >= 0) ::send(interrupt_fd_, r.data(), r.size(), MSG_NOSIGNAL); 
 }
 
 bool BtL2capBackend::try_send_output_report(std::span<const std::uint8_t> r) { 
     if (interrupt_fd_ < 0) return false;
-    return ::write(interrupt_fd_, r.data(), r.size()) > 0; 
+    return ::send(interrupt_fd_, r.data(), r.size(), MSG_NOSIGNAL) > 0; 
 }
 
 void BtL2capBackend::send_feature_get(std::uint8_t id) {
@@ -150,9 +147,8 @@ void BtL2capBackend::send_feature_set(std::span<const std::uint8_t> r) {
 std::optional<std::vector<std::uint8_t>> BtL2capBackend::read_feature_report() { 
     std::vector<std::uint8_t> fake_report(9, 0x00);
     
-    fake_report[0] = 0x05; // Report ID
+    fake_report[0] = 0x05; 
     
-    // MAC-Adresse "00:1b:dc:00:00:00" in REVERSE-Reihenfolge (Little Endian)
     fake_report[1] = 0x00; 
     fake_report[2] = 0x00;
     fake_report[3] = 0x00;
@@ -160,7 +156,6 @@ std::optional<std::vector<std::uint8_t>> BtL2capBackend::read_feature_report() {
     fake_report[5] = 0x1b;
     fake_report[6] = 0x00;
     
-    // Sony Vendor Match-Prüfbits für hid-playstation Handshake
     fake_report[7] = 0x4C; 
     fake_report[8] = 0x05;
     

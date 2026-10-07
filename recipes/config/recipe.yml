@@ -193,32 +193,47 @@ modules:
         set -eu
 
         # ------------------------------------------------------------
-        # Determine target kernel.
+        # Identify the exact kernel for the module that was already built
+        # in the Containerfile stage above.
+        #
+        # IMPORTANT:
+        # Do NOT clean or rebuild the module here. The vDS Makefile's
+        # cleanup path can resolve the build tree from the container/runner
+        # kernel (for example an Azure GitHub runner kernel) rather than the
+        # Fedora/Bazzite kernel in the image. The module built by the earlier
+        # Containerfile stage is already the artifact intended for this
+        # image; this step only signs and installs that artifact.
         # ------------------------------------------------------------
 
-        KERNEL_VERSION="$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | head -n 1)"
-        KERNEL_BUILD_DIR="/usr/src/kernels/${KERNEL_VERSION}"
+        MODULE_PATH="/vds_build_dir/module/vds_hcd.ko"
 
-        if [ ! -d "${KERNEL_BUILD_DIR}" ]; then
-          KERNEL_BUILD_DIR="$(ls -d /usr/src/kernels/* | head -n 1)"
+        if [ ! -f "${MODULE_PATH}" ]; then
+          echo "ERROR: expected vDS kernel module not found: ${MODULE_PATH}" >&2
+          exit 1
         fi
 
-        echo "vDS target kernel: ${KERNEL_VERSION}"
+        KERNEL_VERSION="$(modinfo -F vermagic "${MODULE_PATH}" | awk '{print $1}')"
+
+        if [ -z "${KERNEL_VERSION}" ]; then
+          echo "ERROR: could not determine kernel version from vds_hcd.ko" >&2
+          exit 1
+        fi
+
+        KERNEL_BUILD_DIR="/usr/src/kernels/${KERNEL_VERSION}"
+        SIGN_FILE="${KERNEL_BUILD_DIR}/scripts/sign-file"
+
+        echo "vDS module kernel: ${KERNEL_VERSION}"
         echo "vDS kernel build directory: ${KERNEL_BUILD_DIR}"
 
-        # ------------------------------------------------------------
-        # Rebuild the kernel module in this final build step so the
-        # exact artifact that gets signed is the artifact installed.
-        # ------------------------------------------------------------
+        if [ ! -d "${KERNEL_BUILD_DIR}" ]; then
+          echo "ERROR: kernel build directory not found: ${KERNEL_BUILD_DIR}" >&2
+          exit 1
+        fi
 
-        cd /vds_build_dir/module
-
-        make clean
-        make KCFLAGS="-w" \
-          KERNELRELEASE="${KERNEL_VERSION}" \
-          KERNELDIR="${KERNEL_BUILD_DIR}"
-
-        test -f vds_hcd.ko
+        if [ ! -x "${SIGN_FILE}" ]; then
+          echo "ERROR: sign-file not found: ${SIGN_FILE}" >&2
+          exit 1
+        fi
 
         # ------------------------------------------------------------
         # Signing inputs are ephemeral BuildKit/BlueBuild secrets.
@@ -228,13 +243,6 @@ modules:
 
         test -s /run/secrets/vds-module-signing-key
         test -s /run/secrets/vds-module-signing-cert
-
-        SIGN_FILE="${KERNEL_BUILD_DIR}/scripts/sign-file"
-
-        if [ ! -x "${SIGN_FILE}" ]; then
-          echo "ERROR: sign-file not found: ${SIGN_FILE}" >&2
-          exit 1
-        fi
 
         # Sign the module in-place. The private key is read directly from
         # the ephemeral secret mount and is never copied into the image.

@@ -1,0 +1,585 @@
+---
+# yaml-language-server: $schema=https://blue-build.org
+#
+# vDS-enabled Bazzite image with a Secure Boot-signed vds_hcd kernel module.
+#
+# REQUIRED BUILD ENVIRONMENT / GITHUB ACTION SECRETS:
+#
+#   VDS_MODULE_SIGNING_KEY
+#       PEM private key matching the Secure Boot/MOK certificate that is
+#       enrolled on the target machine.
+#
+#   VDS_MODULE_SIGNING_CERT
+#       X.509 certificate (DER or PEM) corresponding to that private key.
+#
+# The private key is NEVER copied into the image. BlueBuild mounts it as an
+# ephemeral secret for the signing build step only. It is not written into
+# /usr, /etc, /var, an RPM, or any other persistent image path.
+#
+# IMPORTANT:
+# This image is intended for machines that trust the certificate used above.
+# Do not put the private key in this repository.
+
+name: vds-blueprint-bazzite
+
+description: "Personalized Bazzite image featuring native vDS (Virtual DualSense) driver and daemon (v0.4.0) with a Secure Boot-signed vds_hcd module"
+
+base-image: ghcr.io/ublue-os/bazzite
+image-version: latest
+
+modules:
+  # Build dependencies for the vDS kernel module and userspace daemon.
+  - type: rpm-ostree
+    install:
+      - kernel-devel
+      - kernel-headers
+      - akmods
+      - make
+      - gcc
+      - gcc-c++
+      - cmake
+      - git
+      - dbus-devel
+      - opus-devel
+      - systemd-devel
+      - libudev-devel
+      - elfutils-libelf-devel
+
+  # Keep the repository's existing source preparation in a Containerfile
+  # module. In particular, COPY preserves the existing location of the
+  # repository-local vds-proxy.c and vds_bt.cc files.
+  - type: containerfile
+    snippets:
+      - |
+        # Block 1: Clone vDS upstream repository.
+        RUN git clone --depth 1 https://github.com/hurryman2212/vds.git /vds_build_dir
+
+      - |
+        # Block 2: Determine the exact kernel version supplied by Bazzite.
+        RUN KERNEL_VERSION="$(basename "$(ls -d /usr/lib/modules/*fc* | head -n 1)")" && \
+            KERNEL_BUILD_DIR="/usr/src/kernels/${KERNEL_VERSION}" && \
+            if [ ! -d "${KERNEL_BUILD_DIR}" ]; then \
+              KERNEL_BUILD_DIR="$(ls -d /usr/src/kernels/* | head -n 1)"; \
+            fi && \
+            cd /vds_build_dir/module && \
+            make KCFLAGS="-w" \
+              KERNELRELEASE="${KERNEL_VERSION}" \
+              KERNELDIR="${KERNEL_BUILD_DIR}"
+
+      - |
+        # Block 3: Standalone BlueZ headers used by the isolated userspace build.
+        RUN mkdir -p /vds_build_dir/include/bluetooth && \
+            cat << 'EOF' > /vds_build_dir/include/bluetooth/bluetooth.h
+        #ifndef __BLUETOOTH_H
+        #define __BLUETOOTH_H
+
+        #include <stdint.h>
+        #include <sys/socket.h>
+        #include <string.h>
+        #include <stdio.h>
+
+        #ifndef AF_BLUETOOTH
+        #define AF_BLUETOOTH 31
+        #endif
+
+        #ifndef PF_BLUETOOTH
+        #define PF_BLUETOOTH AF_BLUETOOTH
+        #endif
+
+        #define BTPROTO_L2CAP 0
+
+        typedef struct { uint8_t b[6]; } __attribute__((packed)) bdaddr_t;
+
+        static inline int bacmp(const bdaddr_t *ba1, const bdaddr_t *ba2) {
+            return memcmp(ba1, ba2, 6);
+        }
+
+        static inline void bacpy(bdaddr_t *dst, const bdaddr_t *src) {
+            memcpy(dst, src, 6);
+        }
+
+        static inline uint16_t htobs(uint16_t n) {
+            return n;
+        }
+
+        static inline int ba2str(const bdaddr_t *ba, char *str) {
+            return sprintf(
+                str,
+                "%02x:%02x:%02x:%02x:%02x:%02x",
+                ba->b[5], ba->b[4], ba->b[3],
+                ba->b[2], ba->b[1], ba->b[0]
+            );
+        }
+
+        #endif
+        EOF
+
+      - |
+        RUN cat << 'EOF' > /vds_build_dir/include/bluetooth/l2cap.h
+        #ifndef __L2CAP_H
+        #define __L2CAP_H
+
+        #include <bluetooth/bluetooth.h>
+
+        #ifdef __cplusplus
+        extern "C" {
+        #endif
+
+        struct sockaddr_l2 {
+            sa_family_t l2_family;
+            uint16_t l2_psm;
+            bdaddr_t l2_bdaddr;
+            uint16_t l2_cid;
+            uint8_t l2_bdaddr_type;
+        };
+
+        #ifdef __cplusplus
+        }
+        #endif
+
+        #ifdef __cplusplus
+        static_assert(sizeof(struct sockaddr_l2) == 14,
+                      "sockaddr_l2 size mismatch");
+        #else
+        _Static_assert(sizeof(struct sockaddr_l2) == 14,
+                       "sockaddr_l2 size mismatch");
+        #endif
+
+        #endif
+        EOF
+
+      - |
+        # Block 4: Apply the repository-local vDS userspace modifications.
+        COPY vds-proxy.c /vds_build_dir/vds-proxy.c
+        COPY vds_bt.cc /vds_build_dir/vds_bt.cc
+
+      - |
+        RUN cd /vds_build_dir && \
+            cp /vds_build_dir/vds_bt.cc \
+               /vds_build_dir/src/platform/linux/vds_bt.cc && \
+            sed -i \
+              '/pkg_check_modules.*bluez/c\
+        set(bluez_FOUND TRUE)\
+        set(bluez_INCLUDE_DIRS "/vds_build_dir/include")\
+        set(bluez_LIBRARIES "")' \
+              CMakeLists.txt && \
+            sed -i 's/PkgConfig::BLUEZ//g' CMakeLists.txt && \
+            sed -i \
+              "s|vds::bluez_device_modalias(address);|std::optional<std::string>(\"usb\x3av054Cp0CE6d0100\");|g" \
+              src/platform/linux/vdsd.cc
+
+  # The signing/build step is a BlueBuild script module specifically so the
+  # signing key can be mounted as an ephemeral secret.
+  #
+  # no-cache is deliberate: the result must never come from a layer cached
+  # before the signing secret was supplied.
+  - type: script
+    no-cache: true
+    secrets:
+      - type: env
+        name: VDS_MODULE_SIGNING_KEY
+        mount:
+          type: file
+          destination: /run/secrets/vds-module-signing-key
+
+      - type: env
+        name: VDS_MODULE_SIGNING_CERT
+        mount:
+          type: file
+          destination: /run/secrets/vds-module-signing-cert
+
+    snippets:
+      - |
+        set -eu
+
+        # ------------------------------------------------------------
+        # Determine target kernel.
+        # ------------------------------------------------------------
+
+        KERNEL_VERSION="$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | head -n 1)"
+        KERNEL_BUILD_DIR="/usr/src/kernels/${KERNEL_VERSION}"
+
+        if [ ! -d "${KERNEL_BUILD_DIR}" ]; then
+          KERNEL_BUILD_DIR="$(ls -d /usr/src/kernels/* | head -n 1)"
+        fi
+
+        echo "vDS target kernel: ${KERNEL_VERSION}"
+        echo "vDS kernel build directory: ${KERNEL_BUILD_DIR}"
+
+        # ------------------------------------------------------------
+        # Rebuild the kernel module in this final build step so the
+        # exact artifact that gets signed is the artifact installed.
+        # ------------------------------------------------------------
+
+        cd /vds_build_dir/module
+
+        make clean
+        make KCFLAGS="-w" \
+          KERNELRELEASE="${KERNEL_VERSION}" \
+          KERNELDIR="${KERNEL_BUILD_DIR}"
+
+        test -f vds_hcd.ko
+
+        # ------------------------------------------------------------
+        # Signing inputs are ephemeral BuildKit/BlueBuild secrets.
+        #
+        # Do not cat, echo, printf, or otherwise log either secret.
+        # ------------------------------------------------------------
+
+        test -s /run/secrets/vds-module-signing-key
+        test -s /run/secrets/vds-module-signing-cert
+
+        SIGN_FILE="${KERNEL_BUILD_DIR}/scripts/sign-file"
+
+        if [ ! -x "${SIGN_FILE}" ]; then
+          echo "ERROR: sign-file not found: ${SIGN_FILE}" >&2
+          exit 1
+        fi
+
+        # Sign the module in-place. The private key is read directly from
+        # the ephemeral secret mount and is never copied into the image.
+        "${SIGN_FILE}" \
+          sha256 \
+          /run/secrets/vds-module-signing-key \
+          /run/secrets/vds-module-signing-cert \
+          /vds_build_dir/module/vds_hcd.ko
+
+        # Verify the signature metadata without exposing key material.
+        modinfo /vds_build_dir/module/vds_hcd.ko | \
+          grep -E '^(signer|sig_key|sig_hashalgo):'
+
+        # ------------------------------------------------------------
+        # Install ONLY the signed module.
+        # ------------------------------------------------------------
+
+        install -D -m 0644 \
+          /vds_build_dir/module/vds_hcd.ko \
+          "/usr/lib/modules/${KERNEL_VERSION}/extra/vds_hcd.ko"
+
+        depmod -a "${KERNEL_VERSION}"
+
+        # ------------------------------------------------------------
+        # Build userspace.
+        # ------------------------------------------------------------
+
+        g++ -O3 -Wall \
+          /vds_build_dir/vds-proxy.c \
+          -o /vds_build_dir/vds-proxy-bin
+
+        cd /vds_build_dir
+        mkdir -p build
+        cd build
+
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_FLAGS="-isystem /vds_build_dir/include" \
+          -DCMAKE_CXX_FLAGS="-isystem /vds_build_dir/include"
+
+        make -j"$(nproc)"
+
+        install -D -m 0755 \
+          /vds_build_dir/build/vdsd \
+          /usr/bin/vdsd
+
+        install -D -m 0755 \
+          /vds_build_dir/build/vdsctl \
+          /usr/bin/vdsctl
+
+        install -D -m 0755 \
+          /vds_build_dir/vds-proxy-bin \
+          /usr/bin/vds-proxy
+
+        # ------------------------------------------------------------
+        # System directories.
+        # ------------------------------------------------------------
+
+        mkdir -p \
+          /usr/lib/modules-load.d \
+          /usr/lib/systemd/system/bluetooth.service.d \
+          /usr/lib/systemd/system-preset \
+          /usr/lib/systemd/system/multi-user.target.wants \
+          /usr/share/dbus-1/system.d \
+          /usr/lib/udev/rules.d \
+          /usr/share/vdsd \
+          /usr/share/wireplumber/wireplumber.conf.d \
+          /etc/wireplumber/wireplumber.conf.d \
+          /etc/systemd/system/multi-user.target.wants
+
+        # ------------------------------------------------------------
+        # Load the signed module during boot.
+        # ------------------------------------------------------------
+
+        printf '%s\n' 'vds_hcd' \
+          > /usr/lib/modules-load.d/vds.conf
+
+        # ------------------------------------------------------------
+        # Systemd preset.
+        # ------------------------------------------------------------
+
+        printf '%s\n' \
+          'enable vdsd.service' \
+          'enable vds-proxy.service' \
+          'enable vds-chmod-sdp.path' \
+          > /usr/lib/systemd/system-preset/99-vds.preset
+
+        # ------------------------------------------------------------
+        # vDS Bluetooth proxy.
+        # ------------------------------------------------------------
+
+        cat > /usr/lib/systemd/system/vds-proxy.service <<'EOF'
+        [Unit]
+        Description=vDS Dynamic Bluetooth Socket Router
+        After=bluetooth.service systemd-udevd.service
+        Requires=bluetooth.service
+
+        [Service]
+        Type=simple
+        ExecStartPre=/usr/bin/sleep 5
+        ExecStart=/usr/bin/vds-proxy
+        Restart=always
+        RestartSec=5
+        User=root
+
+        CapabilityBoundingSet=CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_RAWIO
+        AmbientCapabilities=CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_RAWIO
+
+        Nice=-10
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        # ------------------------------------------------------------
+        # Module readiness service.
+        #
+        # The actual module is already signed and baked into the image.
+        # This service verifies it can be loaded before vdsd starts.
+        # ------------------------------------------------------------
+
+        cat > /usr/lib/systemd/system/vds_hcd.service <<'EOF'
+        [Unit]
+        Description=vDS signed kernel module
+        Before=vdsd.service
+        After=systemd-modules-load.service
+        ConditionPathExists=/usr/lib/modules
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/modprobe vds_hcd
+        ExecStart=/usr/bin/test -e /dev/vds0
+        RemainAfterExit=yes
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        # ------------------------------------------------------------
+        # vDS daemon.
+        # ------------------------------------------------------------
+
+        cat > /usr/lib/systemd/system/vdsd.service <<'EOF'
+        [Unit]
+        Description=Virtual DualSense Userspace Daemon (v0.4.0 Native)
+        Requires=vds_hcd.service
+        After=vds_hcd.service bluetooth.service vds-proxy.service
+
+        [Service]
+        Type=simple
+        ExecStartPre=/usr/bin/mkdir -p /var/lib/vdsd
+        ExecStartPre=/usr/bin/chmod 666 /dev/uhid
+        ExecStartPre=/usr/bin/sleep 7
+        ExecStart=/usr/bin/vdsd
+
+        Restart=always
+        RestartSec=5
+
+        User=root
+        Group=root
+
+        ProtectSystem=false
+        ProtectHome=false
+        PrivateTmp=no
+        PrivateDevices=no
+        PrivateNetwork=no
+        ReadWritePaths=/
+
+        RestrictAddressFamilies=AF_UNIX AF_BLUETOOTH AF_INPUT AF_NETLINK
+        RestrictNetworkInterfaces=
+        IPAddressDeny=
+        NoNewPrivileges=no
+
+        CapabilityBoundingSet=CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_RAWIO
+        AmbientCapabilities=CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_RAWIO
+
+        Nice=-10
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        # ------------------------------------------------------------
+        # SDP socket permissions.
+        # ------------------------------------------------------------
+
+        cat > /usr/lib/systemd/system/vds-chmod-sdp.service <<'EOF'
+        [Unit]
+        Description=Set permissions for vDS SDP socket
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/bin/chmod 0777 /run/sdp
+        RemainAfterExit=yes
+        EOF
+
+        cat > /usr/lib/systemd/system/vds-chmod-sdp.path <<'EOF'
+        [Unit]
+        Description=Monitor BlueZ SDP socket for vDS
+
+        [Path]
+        PathChanged=/run/sdp
+        Unit=vds-chmod-sdp.service
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        # ------------------------------------------------------------
+        # Bluetooth override.
+        # ------------------------------------------------------------
+
+        cat > /usr/lib/systemd/system/bluetooth.service.d/override.conf <<'EOF'
+        [Service]
+        ExecStart=
+        ExecStart=/usr/libexec/bluetooth/bluetoothd --compat --noplugin=input
+        EOF
+
+        # ------------------------------------------------------------
+        # vDS configuration.
+        # ------------------------------------------------------------
+
+        cat > /usr/share/vdsd/main.conf <<'EOF'
+        [General]
+        ClassicBondedOnly=false
+        EOF
+
+        # ------------------------------------------------------------
+        # D-Bus policy.
+        # ------------------------------------------------------------
+
+        cat > /usr/share/dbus-1/system.d/org.vds.conf <<'EOF'
+        <!DOCTYPE busconfig PUBLIC
+          "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+          "http://freedesktop.org">
+        <busconfig>
+          <policy user="root">
+            <allow own="org.vds"/>
+            <allow send_destination="org.vds"/>
+          </policy>
+          <policy context="default">
+            <allow send_destination="org.vds"/>
+          </policy>
+        </busconfig>
+        EOF
+
+        # ------------------------------------------------------------
+        # DualSense udev rules.
+        # ------------------------------------------------------------
+
+        cat > /usr/lib/udev/rules.d/99-vds-dualsense-udev.rules <<'EOF'
+        SUBSYSTEM!="input", GOTO="vds_end"
+        KERNEL!="event*", GOTO="vds_end"
+        ATTR{name}!="DualSense Wireless Controller", GOTO="vds_end"
+
+        ACTION!="add", GOTO="vds_end"
+
+        RUN+="/usr/bin/vdsctl attach $attr{properties/uniq}"
+
+        LABEL="vds_end"
+        EOF
+
+        cat > /usr/lib/udev/rules.d/99-vds-uinput.rules <<'EOF'
+        KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+        KERNEL=="vds[0-9]*", MODE="0660", GROUP="input", TAG+="systemd"
+        EOF
+
+        # ------------------------------------------------------------
+        # WirePlumber configuration.
+        # ------------------------------------------------------------
+
+        cat > /usr/share/wireplumber/wireplumber.conf.d/99-vds-prioritisation.conf <<'EOF'
+        monitor.alsa.rules = [
+          {
+            matches = [
+              { node.name = "~alsa_output.usb-Sony_Interactive_Entertainment.*" }
+            ]
+            actions = {
+              update-props = {
+                alsa.card_id = "WirelessController"
+                alsa.card_name = "WirelessController"
+                device.nick = "WirelessController"
+                node.name = "alsa_output.usb-Sony_Interactive_Entertainment_WirelessController-00.pro-audio"
+                node.description = "WirelessController"
+                node.nick = "WirelessController"
+                api.alsa.use-acp = false
+                audio.channels = 4
+                audio.position = [ "FL", "FR", "RL", "RR" ]
+                priority.driver = 1500
+                priority.session = 1500
+                session.suspend-on-idle = false
+              }
+            }
+          },
+          {
+            matches = [
+              { node.name = "~alsa_output.pci.*DualSense.*" },
+              { node.name = "~alsa_input.pci.*DualSense.*" },
+              { node.description = "~.*DualSense wireless controller.*" }
+            ]
+            actions = {
+              update-props = {
+                device.disabled = true
+                node.disabled = true
+              }
+            }
+          }
+        ]
+        EOF
+
+        ln -sf \
+          ../../../usr/share/wireplumber/wireplumber.conf.d/99-vds-prioritisation.conf \
+          /etc/wireplumber/wireplumber.conf.d/99-vds-prioritisation.conf
+
+        # ------------------------------------------------------------
+        # Enable services.
+        # ------------------------------------------------------------
+
+        ln -sf \
+          /usr/lib/systemd/system/vds_hcd.service \
+          /etc/systemd/system/multi-user.target.wants/vds_hcd.service
+
+        ln -sf \
+          /usr/lib/systemd/system/vds-proxy.service \
+          /etc/systemd/system/multi-user.target.wants/vds-proxy.service
+
+        ln -sf \
+          /usr/lib/systemd/system/vdsd.service \
+          /etc/systemd/system/multi-user.target.wants/vdsd.service
+
+        ln -sf \
+          /usr/lib/systemd/system/vds-chmod-sdp.path \
+          /etc/systemd/system/multi-user.target.wants/vds-chmod-sdp.path
+
+        # ------------------------------------------------------------
+        # Verify that no signing material was accidentally persisted.
+        # The actual private key exists only under /run/secrets while this
+        # module is executing and is not copied anywhere.
+        # ------------------------------------------------------------
+
+        if find /usr /etc /opt /var -xdev -type f \
+             \( -name '*vds-module-signing*' -o -name '*VDS_MODULE_SIGNING*' \) \
+             -print -quit 2>/dev/null | grep -q .; then
+          echo "ERROR: signing material appears to have been persisted" >&2
+          exit 1
+        fi
+
+        rm -rf /vds_build_dir

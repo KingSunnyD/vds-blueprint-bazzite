@@ -46,8 +46,7 @@ modules:
       - elfutils-libelf-devel
 
   # Keep the repository's existing source preparation in a Containerfile
-  # module. In particular, COPY preserves the existing location of the
-  # repository-local vds-proxy.c and vds_bt.cc files.
+  # module. The repository-local vds_bt.cc customization is retained.
   - type: containerfile
     snippets:
       - |
@@ -148,7 +147,6 @@ modules:
 
       - |
         # Block 4: Apply the repository-local vDS userspace modifications.
-        COPY vds-proxy.c /vds_build_dir/vds-proxy.c
         COPY vds_bt.cc /vds_build_dir/vds_bt.cc
 
       - |
@@ -261,10 +259,6 @@ modules:
         # Build userspace.
         # ------------------------------------------------------------
 
-        g++ -O3 -Wall \
-          /vds_build_dir/vds-proxy.c \
-          -o /vds_build_dir/vds-proxy-bin
-
         cd /vds_build_dir
         mkdir -p build
         cd build
@@ -305,10 +299,6 @@ modules:
           /vds_build_dir/build/vdsctl \
           /usr/bin/vdsctl
 
-        install -D -m 0755 \
-          /vds_build_dir/vds-proxy-bin \
-          /usr/bin/vds-proxy
-
         # ------------------------------------------------------------
         # System directories.
         # ------------------------------------------------------------
@@ -338,36 +328,8 @@ modules:
 
         printf '%s\n' \
           'enable vdsd.service' \
-          'enable vds-proxy.service' \
           'enable vds-chmod-sdp.path' \
           > /usr/lib/systemd/system-preset/99-vds.preset
-
-        # ------------------------------------------------------------
-        # vDS Bluetooth proxy.
-        # ------------------------------------------------------------
-
-        cat > /usr/lib/systemd/system/vds-proxy.service <<'EOF'
-        [Unit]
-        Description=vDS Dynamic Bluetooth Socket Router
-        After=bluetooth.service systemd-udevd.service
-        Requires=bluetooth.service
-
-        [Service]
-        Type=simple
-        ExecStartPre=/usr/bin/sleep 5
-        ExecStart=/usr/bin/vds-proxy
-        Restart=always
-        RestartSec=5
-        User=root
-
-        CapabilityBoundingSet=CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_RAWIO
-        AmbientCapabilities=CAP_NET_RAW CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_RAWIO
-
-        Nice=-10
-
-        [Install]
-        WantedBy=multi-user.target
-        EOF
 
         # ------------------------------------------------------------
         # Module readiness service.
@@ -401,7 +363,7 @@ modules:
         [Unit]
         Description=Virtual DualSense Userspace Daemon (v0.4.0 Native)
         Requires=vds_hcd.service
-        After=vds_hcd.service bluetooth.service vds-proxy.service
+        After=vds_hcd.service bluetooth.service
 
         [Service]
         Type=simple
@@ -470,7 +432,7 @@ modules:
         cat > /usr/lib/systemd/system/bluetooth.service.d/override.conf <<'EOF'
         [Service]
         ExecStart=
-        ExecStart=/usr/libexec/bluetooth/bluetoothd --compat
+        ExecStart=/usr/libexec/bluetooth/bluetoothd --compat --noplugin=input
         EOF
 
         # ------------------------------------------------------------
@@ -578,16 +540,22 @@ modules:
           /etc/systemd/system/multi-user.target.wants/vds_hcd.service
 
         ln -sf \
-          /usr/lib/systemd/system/vds-proxy.service \
-          /etc/systemd/system/multi-user.target.wants/vds-proxy.service
-
-        ln -sf \
           /usr/lib/systemd/system/vdsd.service \
           /etc/systemd/system/multi-user.target.wants/vdsd.service
 
         ln -sf \
           /usr/lib/systemd/system/vds-chmod-sdp.path \
           /etc/systemd/system/multi-user.target.wants/vds-chmod-sdp.path
+
+        # ------------------------------------------------------------
+        # Verify that the obsolete custom Bluetooth proxy is not installed.
+        # Upstream vDS owns the HID Control/Interrupt L2CAP channels directly.
+        # ------------------------------------------------------------
+
+        if [ -e /usr/bin/vds-proxy ] || [ -e /usr/lib/systemd/system/vds-proxy.service ]; then
+          echo "ERROR: obsolete vds-proxy component was persisted" >&2
+          exit 1
+        fi
 
         # ------------------------------------------------------------
         # Verify that no signing material was accidentally persisted.

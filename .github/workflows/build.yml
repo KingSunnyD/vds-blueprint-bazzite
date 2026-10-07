@@ -22,6 +22,9 @@ jobs:
     steps:
       - name: Build Image
         uses: blue-build/github-action@v1
+        env:
+          VDS_MODULE_SIGNING_KEY: ${{ secrets.VDS_MODULE_SIGNING_KEY }}
+          VDS_MODULE_SIGNING_CERT: ${{ secrets.VDS_MODULE_SIGNING_CERT }}
         with:
           recipe: 'config/recipe.yml'
           registry_token: ${{ github.token }}

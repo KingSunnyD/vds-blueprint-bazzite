@@ -470,7 +470,7 @@ modules:
         cat > /usr/lib/systemd/system/bluetooth.service.d/override.conf <<'EOF'
         [Service]
         ExecStart=
-        ExecStart=/usr/libexec/bluetooth/bluetoothd --compat --noplugin=input
+        ExecStart=/usr/libexec/bluetooth/bluetoothd --compat
         EOF
 
         # ------------------------------------------------------------

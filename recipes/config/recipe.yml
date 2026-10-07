@@ -41,6 +41,7 @@ modules:
       - git
       - dbus-devel
       - opus-devel
+      - bluez-libs-devel
       - systemd-devel
       - libudev-devel
       - elfutils-libelf-devel
@@ -56,11 +57,9 @@ modules:
 
       - |
         # Block 2: Determine the exact kernel version supplied by Bazzite.
-        RUN KERNEL_VERSION="$(basename "$(ls -d /usr/lib/modules/*fc* | head -n 1)")" && \
+        RUN KERNEL_VERSION="$(basename "$(ls -d /usr/lib/modules/*fc* | sort -V | tail -n 1)")" && \
             KERNEL_BUILD_DIR="/usr/src/kernels/${KERNEL_VERSION}" && \
-            if [ ! -d "${KERNEL_BUILD_DIR}" ]; then \
-              KERNEL_BUILD_DIR="$(ls -d /usr/src/kernels/* | head -n 1)"; \
-            fi && \
+            test -d "${KERNEL_BUILD_DIR}" && \
             cd /vds_build_dir/module && \
             make KCFLAGS="-w" \
               KERNELRELEASE="${KERNEL_VERSION}" \
@@ -157,13 +156,6 @@ modules:
         RUN cd /vds_build_dir && \
             cp /vds_build_dir/vds_bt.cc \
                /vds_build_dir/src/platform/linux/vds_bt.cc && \
-            sed -i \
-              '/pkg_check_modules.*bluez/c\
-        set(bluez_FOUND TRUE)\
-        set(bluez_INCLUDE_DIRS "/vds_build_dir/include")\
-        set(bluez_LIBRARIES "")' \
-              CMakeLists.txt && \
-            sed -i 's/PkgConfig::BLUEZ//g' CMakeLists.txt && \
             sed -i \
               "s|vds::bluez_device_modalias(address);|std::optional<std::string>(\"usb\x3av054Cp0CE6d0100\");|g" \
               src/platform/linux/vdsd.cc

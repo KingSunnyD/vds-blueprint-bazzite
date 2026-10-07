@@ -41,7 +41,6 @@ modules:
       - git
       - dbus-devel
       - opus-devel
-      - bluez-libs-devel
       - systemd-devel
       - libudev-devel
       - elfutils-libelf-devel

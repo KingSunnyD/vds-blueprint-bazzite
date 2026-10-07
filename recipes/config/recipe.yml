@@ -269,6 +269,27 @@ modules:
         mkdir -p build
         cd build
 
+        # ------------------------------------------------------------
+        # BlueZ development files must exist in THIS Containerfile layer.
+        #
+        # The rpm-ostree package module is intentionally retained for the
+        # final image, but the previous build proved that bluez.pc was not
+        # present in the actual CMake build environment. Install and verify
+        # the development package immediately before CMake so the build
+        # cannot silently depend on a package from a different stage/layer.
+        # ------------------------------------------------------------
+
+        dnf5 install -y bluez-libs-devel
+
+        export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+        test -f /usr/lib64/pkgconfig/bluez.pc || \
+          test -f /usr/lib/pkgconfig/bluez.pc
+
+        pkg-config --modversion bluez
+        pkg-config --cflags bluez
+        pkg-config --libs bluez
+
         cmake .. \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_FLAGS="-isystem /vds_build_dir/include" \

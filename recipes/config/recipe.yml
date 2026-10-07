@@ -20,11 +20,11 @@
 # This image is intended for machines that trust the certificate used above.
 # Do not put the private key in this repository.
 
-name: vds-blueprint-bazzite
+name: vds-blueprint-bazzite-deck
 
 description: "Personalized Bazzite image featuring native vDS (Virtual DualSense) driver and daemon (v0.4.0) with a Secure Boot-signed vds_hcd module"
 
-base-image: ghcr.io/ublue-os/bazzite
+base-image: ghcr.io/ublue-os/bazzite-deck
 image-version: latest
 
 modules:

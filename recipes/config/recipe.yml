@@ -45,8 +45,8 @@ modules:
       - libudev-devel
       - elfutils-libelf-devel
 
-  # Keep the repository's existing source preparation in a Containerfile
-  # module. The repository-local vds_bt.cc customization is retained.
+  # Prepare and build the upstream vDS source without repository-local
+  # Bluetooth transport or device-modalias modifications.
   - type: containerfile
     snippets:
       - |
@@ -64,98 +64,16 @@ modules:
               KERNELDIR="${KERNEL_BUILD_DIR}"
 
       - |
-        # Block 3: Standalone BlueZ headers used by the isolated userspace build.
-        RUN mkdir -p /vds_build_dir/include/bluetooth && \
-            cat << 'EOF' > /vds_build_dir/include/bluetooth/bluetooth.h
-        #ifndef __BLUETOOTH_H
-        #define __BLUETOOTH_H
-
-        #include <stdint.h>
-        #include <sys/socket.h>
-        #include <string.h>
-        #include <stdio.h>
-
-        #ifndef AF_BLUETOOTH
-        #define AF_BLUETOOTH 31
-        #endif
-
-        #ifndef PF_BLUETOOTH
-        #define PF_BLUETOOTH AF_BLUETOOTH
-        #endif
-
-        #define BTPROTO_L2CAP 0
-
-        typedef struct { uint8_t b[6]; } __attribute__((packed)) bdaddr_t;
-
-        static inline int bacmp(const bdaddr_t *ba1, const bdaddr_t *ba2) {
-            return memcmp(ba1, ba2, 6);
-        }
-
-        static inline void bacpy(bdaddr_t *dst, const bdaddr_t *src) {
-            memcpy(dst, src, 6);
-        }
-
-        static inline uint16_t htobs(uint16_t n) {
-            return n;
-        }
-
-        static inline int ba2str(const bdaddr_t *ba, char *str) {
-            return sprintf(
-                str,
-                "%02x:%02x:%02x:%02x:%02x:%02x",
-                ba->b[5], ba->b[4], ba->b[3],
-                ba->b[2], ba->b[1], ba->b[0]
-            );
-        }
-
-        #endif
-        EOF
-
-      - |
-        RUN cat << 'EOF' > /vds_build_dir/include/bluetooth/l2cap.h
-        #ifndef __L2CAP_H
-        #define __L2CAP_H
-
-        #include <bluetooth/bluetooth.h>
-
-        #ifdef __cplusplus
-        extern "C" {
-        #endif
-
-        struct sockaddr_l2 {
-            sa_family_t l2_family;
-            uint16_t l2_psm;
-            bdaddr_t l2_bdaddr;
-            uint16_t l2_cid;
-            uint8_t l2_bdaddr_type;
-        };
-
-        #ifdef __cplusplus
-        }
-        #endif
-
-        #ifdef __cplusplus
-        static_assert(sizeof(struct sockaddr_l2) == 14,
-                      "sockaddr_l2 size mismatch");
-        #else
-        _Static_assert(sizeof(struct sockaddr_l2) == 14,
-                       "sockaddr_l2 size mismatch");
-        #endif
-
-        #endif
-        EOF
-
-      - |
-        # Block 4: Apply the repository-local vDS userspace modifications.
-        COPY vds_bt.cc /vds_build_dir/vds_bt.cc
-
-      - |
+        # Block 3: Verify that the upstream Bluetooth backend is present.
+        # The upstream vDS daemon owns HID Control/Interrupt L2CAP PSMs
+        # 0x0011 and 0x0013 directly; do not replace it with a proxy or
+        # abstract UNIX-socket transport.
         RUN cd /vds_build_dir && \
-            cp /vds_build_dir/vds_bt.cc \
-               /vds_build_dir/src/platform/linux/vds_bt.cc && \
-            sed -i \
-              "s|vds::bluez_device_modalias(address);|std::optional<std::string>(\"usb\x3av054Cp0CE6d0100\");|g" \
-              src/platform/linux/vdsd.cc
+            grep -Eq '0x0011|0x11' src/platform/linux/vds_bt.cc && \
+            grep -Eq '0x0013|0x13' src/platform/linux/vds_bt.cc && \
+            ! grep -R -q 'vds::bluez_device_modalias(address).*054Cp0CE6d0100' src/platform/linux/vdsd.cc && \
+            ! grep -R -q '@v_c\\|@v_i' src/platform/linux/vds_bt.cc src/platform/linux/vdsd.cc
+
 
   # The signing/build step is a BlueBuild script module specifically so the
   # signing key can be mounted as an ephemeral secret.
@@ -285,9 +203,7 @@ modules:
         pkg-config --libs bluez
 
         cmake .. \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_FLAGS="-isystem /vds_build_dir/include" \
-          -DCMAKE_CXX_FLAGS="-isystem /vds_build_dir/include"
+          -DCMAKE_BUILD_TYPE=Release
 
         make -j"$(nproc)"
 
